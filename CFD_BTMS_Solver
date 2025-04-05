@@ -1,0 +1,429 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Rectangle
+
+def initialize_mat(dx, dy, Lx, Ly, nx, ny, room_temp):
+    """Initialize grid matrices for pressure, velocity, and temperature fields."""
+    # Pressure grid points (staggered grid)
+    x_p_extended = np.linspace(-dx/2, Lx+dx/2, nx+2)
+    y_p_extended = np.linspace(-dy/2, Ly+dy/2, ny+2)
+    x_p, y_p = np.meshgrid(x_p_extended, y_p_extended)
+    
+    # U-velocity grid points (staggered in x-direction)
+    x_u_extended = np.linspace(0, Lx, nx+1)
+    y_u_extended = np.linspace(-dy/2, Ly+dy/2, ny+2)
+    x_u, y_u = np.meshgrid(x_u_extended, y_u_extended)
+    
+    # V-velocity grid points (staggered in y-direction)
+    x_v_extended = np.linspace(-dx/2, Lx+dx/2, nx+2)
+    y_v_extended = np.linspace(0, Ly, ny+1)
+    x_v, y_v = np.meshgrid(x_v_extended, y_v_extended)
+    
+    # Initialize fields
+    P = np.zeros((ny+2, nx+2))       # Pressure
+    U = np.zeros((ny+2, nx+1))       # X-velocity
+    V = np.zeros((ny+1, nx+2))       # Y-velocity
+    T = np.ones((ny+2, nx+2)) * room_temp  # Temperature
+    
+    return x_p, y_p, x_u, y_u, x_v, y_v, P, U, V, T
+
+def physical_to_grid(pos, L, n):
+    """Convert physical position to grid index."""
+    return int(pos/L * n)
+
+def create_obstacle_masks(x_p, y_p, x_u, y_u, x_v, y_v, obstacles):
+    """Create boolean masks to identify fluid cells (True) vs obstacle cells (False)."""
+    mask_p = np.ones_like(x_p, dtype=bool)
+    mask_u = np.ones_like(x_u, dtype=bool)
+    mask_v = np.ones_like(x_v, dtype=bool)
+    
+    # Mark obstacle regions as False in each grid
+    for obs in obstacles:
+        mask_p &= ~((x_p >= obs['x_start']) & (x_p <= obs['x_end']) &
+                  (y_p >= obs['y_start']) & (y_p <= obs['y_end']))
+        mask_u &= ~((x_u >= obs['x_start']) & (x_u <= obs['x_end']) &
+                  (y_u >= obs['y_start']) & (y_u <= obs['y_end']))
+        mask_v &= ~((x_v >= obs['x_start']) & (x_v <= obs['x_end']) &
+                  (y_v >= obs['y_start']) & (y_v <= obs['y_end']))
+    return mask_p, mask_u, mask_v
+
+def thermal_properties_at_cell(i, j, mask_p, fluid_props, battery_props):
+    """Return material properties (fluid/battery) based on cell type."""
+    if mask_p[i, j]:  # Fluid cell
+        return fluid_props['rho'], fluid_props['cp'], fluid_props['k'], 0.0
+    else:             # Battery cell
+        return battery_props['rho'], battery_props['cp'], battery_props['k_axial'], battery_props['q_gen']
+
+def advection_term(U, V, dx, dy, nx, ny):
+    """Compute advection terms for momentum equations using upwind scheme."""
+    A_u = np.zeros_like(U)
+    A_v = np.zeros_like(V)
+    
+    # X-momentum advection
+    for i in range(1, ny+1):
+        for j in range(1, nx):
+            # Upwind scheme for UU
+            if U[i,j] >= 0:
+                duu_dx = (U[i,j]**2 - U[i,j-1]**2)/dx
+            else:
+                duu_dx = (U[i,j+1]**2 - U[i,j]**2)/dx
+                
+            # Upwind scheme for UV
+            if V[i,j] >= 0:
+                duv_dy = (U[i,j]*V[i,j] - U[i-1,j]*V[i-1,j])/dy
+            else:
+                duv_dy = (U[i+1,j]*V[i+1,j] - U[i,j]*V[i,j])/dy
+                
+            A_u[i,j] = -(duu_dx + duv_dy)
+    
+    # Y-momentum advection        
+    for i in range(1, ny):
+        for j in range(1, nx+1):
+            # Upwind scheme for UV
+            if U[i,j] >= 0:
+                duv_dx = (U[i,j]*V[i,j] - U[i,j-1]*V[i,j-1])/dx
+            else:
+                duv_dx = (U[i,j+1]*V[i,j+1] - U[i,j]*V[i,j])/dx if j+1 < nx+1 else 0
+                
+            # Upwind scheme for VV    
+            if V[i,j] >= 0:
+                dvv_dy = (V[i,j]**2 - V[i-1,j]**2)/dy
+            else:
+                dvv_dy = (V[i+1,j]**2 - V[i,j]**2)/dy
+                
+            A_v[i,j] = -(duv_dx + dvv_dy)
+    
+    return A_u, A_v
+
+def diffusion_term(U, V, dx, dy, nu, nx, ny):
+    """Compute viscous diffusion terms using central differencing."""
+    D_u = np.zeros_like(U)
+    D_v = np.zeros_like(V)
+    
+    # X-momentum diffusion
+    for i in range(1, ny+1):
+        for j in range(1, nx):
+            d2u_dx2 = (U[i,j+1] - 2*U[i,j] + U[i,j-1])/dx**2
+            d2u_dy2 = (U[i+1,j] - 2*U[i,j] + U[i-1,j])/dy**2
+            D_u[i,j] = nu*(d2u_dx2 + d2u_dy2)
+    
+    # Y-momentum diffusion        
+    for i in range(1, ny):
+        for j in range(1, nx+1):
+            d2v_dx2 = (V[i,j+1] - 2*V[i,j] + V[i,j-1])/dx**2
+            d2v_dy2 = (V[i+1,j] - 2*V[i,j] + V[i-1,j])/dy**2
+            D_v[i,j] = nu*(d2v_dx2 + d2v_dy2)
+    
+    return D_u, D_v
+
+def apply_boundary_conditions_velocities(U, V, nx, ny, inlets, outlets, mask_u, mask_v, inlet_temp, inlet_velocity):
+    """Apply boundary conditions for velocity fields."""
+    # No-slip at top/bottom walls
+    U[0,:] = 0; V[0,:] = 0
+    U[ny+1,:] = 0; V[ny,:] = 0
+    
+    # Inlet boundary conditions (left side)
+    for inlet in inlets:
+        if inlet['side'] == 'left':
+            start_i = physical_to_grid(inlet['start'], Ly, ny)
+            end_i = physical_to_grid(inlet['end'], Ly, ny)
+            U[start_i:end_i+1, 0] = inlet_velocity  # Set inlet velocity
+            
+    # Outlet boundary conditions (right side)
+    for outlet in outlets:
+        if outlet['side'] == 'right':
+            start_i = physical_to_grid(outlet['start'], Ly, ny)
+            end_i = physical_to_grid(outlet['end'], Ly, ny)
+            j = nx
+            U[start_i:end_i+1, j] = U[start_i:end_i+1, j-1]  # Zero gradient
+            
+    # Set obstacle cells to zero velocity
+    U[~mask_u] = 0
+    V[~mask_v] = 0
+
+def compute_temporary_velocities(U, V, A_u, D_u, A_v, D_v, dt, nx, ny, inlets, outlets, mask_u, mask_v, inlet_temp, inlet_velocity):
+    """Compute intermediate velocity field before pressure correction."""
+    U_temp = U.copy()
+    V_temp = V.copy()
+    
+    # Update U with advection + diffusion
+    for i in range(1, ny+1):
+        for j in range(1, nx):
+            U_temp[i,j] = U[i,j] + dt*(A_u[i,j] + D_u[i,j])
+    
+    # Update V with advection + diffusion        
+    for i in range(1, ny):
+        for j in range(1, nx+1):
+            V_temp[i,j] = V[i,j] + dt*(A_v[i,j] + D_v[i,j])
+    
+    # Apply BCs to temporary velocities
+    apply_boundary_conditions_velocities(U_temp, V_temp, nx, ny, inlets, outlets, mask_u, mask_v, inlet_temp, inlet_velocity)
+    return U_temp, V_temp
+
+def solve_pressure_poisson(P, U_temp, V_temp, dx, dy, dt, rho, nx, ny, outlets, tol=1e-4, max_iter=5000):
+    """Solve pressure Poisson equation using iterative method."""
+    b = np.zeros_like(P)
+    # Compute divergence of intermediate velocity field
+    for i in range(1, ny+1):
+        for j in range(1, nx+1):
+            b[i,j] = rho/dt * ((U_temp[i,j]-U_temp[i,j-1])/dx + (V_temp[i,j]-V_temp[i-1,j])/dy)
+    
+    pn = P.copy()
+    error = 1
+    iteration = 0
+    
+    # Iterate until convergence
+    while error > tol and iteration < max_iter:
+        p_old = pn.copy()
+        # Jacobi update for pressure
+        pn[1:-1,1:-1] = ((pn[1:-1,2:] + pn[1:-1,:-2])*dy**2 + 
+                         (pn[2:,1:-1] + pn[:-2,1:-1])*dx**2 - 
+                         dx**2*dy**2*b[1:-1,1:-1]) / (2*(dx**2 + dy**2))
+        
+        # Apply Neumann BCs
+        pn[:,0] = pn[:,1]; pn[:,-1] = pn[:,-2]  # Left/Right
+        pn[0,:] = pn[1,:]; pn[-1,:] = pn[-2,:]   # Top/Bottom
+        
+        # Set outlet pressure
+        for outlet in outlets:
+            if outlet['side'] == 'right':
+                start_i = physical_to_grid(outlet['start'], Ly, ny)
+                end_i = physical_to_grid(outlet['end'], Ly, ny)
+                pn[start_i:end_i+1, -1] = outlet.get('pressure', 0.0)
+                
+        error = np.linalg.norm(pn - p_old)/(np.linalg.norm(p_old) + 1e-10)
+        iteration += 1
+        
+    return pn
+
+def update_velocities(U, V, U_temp, V_temp, P, dt, rho, dx, dy, nx, ny, mask_u, mask_v, inlets, outlets, inlet_temp, inlet_velocity):
+    """Correct velocities using pressure gradient."""
+    # Update U with pressure gradient
+    for i in range(1, ny+1):
+        for j in range(1, nx):
+            U[i,j] = U_temp[i,j] - dt/(rho*dx)*(P[i,j+1] - P[i,j])
+    
+    # Update V with pressure gradient        
+    for i in range(1, ny):
+        for j in range(1, nx+1):
+            V[i,j] = V_temp[i,j] - dt/(rho*dy)*(P[i+1,j] - P[i,j])
+    
+    # Apply BCs again to ensure compliance
+    apply_boundary_conditions_velocities(U, V, nx, ny, inlets, outlets, mask_u, mask_v, inlet_temp, inlet_velocity)
+
+def advection_diffusion_temperature(T, U, V, dx, dy, dt, nx, ny, mask_p, fluid_props, battery_props):
+    """Solve energy equation with upwind advection and conduction."""
+    T_new = T.copy()
+    for i in range(1, ny+1):
+        for j in range(1, nx+1):
+            # Get material properties for current cell
+            rho, cp, k, q_gen = thermal_properties_at_cell(i, j, mask_p, fluid_props, battery_props)
+            
+            # Upwind scheme for advection terms
+            if U[i,j] > 0:
+                duTdx = (T[i,j] - T[i,j-1])/dx
+            else:
+                duTdx = (T[i,j+1] - T[i,j])/dx
+                
+            if V[i,j] > 0:
+                dvTdy = (T[i,j] - T[i-1,j])/dy
+            else:
+                dvTdy = (T[i+1,j] - T[i,j])/dy
+                
+            # Diffusion terms (central difference)
+            d2Tdx2 = (T[i,j+1] - 2*T[i,j] + T[i,j-1])/dx**2
+            d2Tdy2 = (T[i+1,j] - 2*T[i,j] + T[i-1,j])/dy**2
+            
+            # Update temperature
+            T_new[i,j] = T[i,j] + dt*(
+                k/(rho*cp)*(d2Tdx2 + d2Tdy2) +  # Conduction
+                q_gen/(rho*cp) -                # Heat generation
+                U[i,j]*duTdx - V[i,j]*dvTdy      # Advection
+            )
+    return T_new
+
+def apply_temperature_bc(T, nx, ny, inlets, inlet_temp):
+    """Apply temperature boundary conditions."""
+    # Adiabatic walls (Neumann BCs)
+    T[0,:] = T[1,:]; T[ny+1,:] = T[ny,:]   # Top/Bottom
+    T[:,0] = T[:,1]; T[:,nx+1] = T[:,nx]   # Left/Right
+    
+    # Inlet temperature (Dirichlet BC)
+    for inlet in inlets:
+        if inlet['side'] == 'left':
+            start_i = physical_to_grid(inlet['start'], Ly, ny)
+            end_i = physical_to_grid(inlet['end'], Ly, ny)
+            T[start_i:end_i+1, 0] = inlet_temp
+
+def generate_centered_2x2_squares(Lx, Ly, sq_length, dx_gap, dy_gap):
+    """Generate four battery obstacles in a centered 2x2 arrangement."""
+    total_width = 2*sq_length + dx_gap
+    total_height = 2*sq_length + dy_gap
+    
+    # Calculate block starting position (centered)
+    block_x_start = Lx/2 - total_width/2
+    block_y_start = Ly/2 + total_height/2 - sq_length
+    
+    # Define coordinates for four squares
+    obstacles = [
+        {  # Top-left
+            'x_start': block_x_start,
+            'x_end': block_x_start + sq_length,
+            'y_start': block_y_start,
+            'y_end': block_y_start + sq_length
+        },
+        {  # Top-right
+            'x_start': block_x_start + sq_length + dx_gap,
+            'x_end': block_x_start + 2*sq_length + dx_gap,
+            'y_start': block_y_start,
+            'y_end': block_y_start + sq_length
+        },
+        {  # Bottom-left
+            'x_start': block_x_start,
+            'x_end': block_x_start + sq_length,
+            'y_start': block_y_start - (sq_length + dy_gap),
+            'y_end': block_y_start - dy_gap
+        },
+        {  # Bottom-right
+            'x_start': block_x_start + sq_length + dx_gap,
+            'x_end': block_x_start + 2*sq_length + dx_gap,
+            'y_start': block_y_start - (sq_length + dy_gap),
+            'y_end': block_y_start - dy_gap
+        }
+    ]
+    return obstacles
+
+# ========== SIMULATION PARAMETERS ========== #
+Lx = 0.1           # Domain width [m]
+Ly = 0.1           # Domain height [m]
+nx = 100           # Grid resolution in x
+ny = 100           # Grid resolution in y
+dx = Lx/nx
+dy = Ly/ny
+dt = 0.0001        # Time step [s]
+density = 1400.0   # Fluid density [kg/m³]
+nu = 9.942e-4      # Kinematic viscosity [m²/s]
+room_temp = 298     # Ambient temperature [K]
+inlet_velocity = 0.05  # Inlet velocity [m/s]
+inlet_temp = 293    # Inlet temperature [K]
+T_initial_battery = 300  # Initial battery temperature [K]
+
+# Material properties
+fluid_props = {    # Coolant properties
+    'rho': 970.0,
+    'cp': 1370.0,
+    'k': 0.15
+}
+battery_props = {  # Battery cell properties
+    'rho': 2047.0,
+    'cp': 1605.0,
+    'k_axial': 32.0,
+    'k_radial': 0.15,
+    'q_gen': 0  # Heat generation rate [W/m³]
+}
+
+# Obstacle configuration (battery arrangement)
+sq_length = 0.02   # Battery cell side length [m]
+dx_gap = 0.01      # Horizontal gap between cells [m]
+dy_gap = 0.01      # Vertical gap between cells [m]
+obstacles = generate_centered_2x2_squares(Lx, Ly, sq_length, dx_gap, dy_gap)
+
+# Boundary conditions configuration
+inlets = [{
+    'side': 'left',
+    'start': 0.06,  # Inlet vertical start position [m]
+    'end': 0.1,     # Inlet vertical end position [m]
+}]
+
+outlets = [{
+    'side': 'right',
+    'start': 0.0,   # Outlet vertical start position [m]
+    'end': 0.04,    # Outlet vertical end position [m]
+    'pressure': 0.0 # Reference pressure [Pa]
+}]
+
+# ========== INITIALIZATION ========== #
+x_p, y_p, x_u, y_u, x_v, y_v, P, U, V, T = initialize_mat(dx, dy, Lx, Ly, nx, ny, room_temp)
+mask_p, mask_u, mask_v = create_obstacle_masks(x_p, y_p, x_u, y_u, x_v, y_v, obstacles)
+
+# Set initial battery temperature
+T[~mask_p] = T_initial_battery  # All obstacle cells set to initial battery temp
+
+# ========== MAIN SIMULATION LOOP ========== #
+frames_T = []  # Store temperature snapshots
+frames_vel = []  # Store velocity magnitude snapshots
+frames_P = []  # Store pressure snapshots
+frame_interval = 100  # Store data every 100 iterations
+
+for n in tqdm(range(20000), desc="CFD Simulation"):
+    # Momentum equations
+    A_u, A_v = advection_term(U, V, dx, dy, nx, ny)
+    D_u, D_v = diffusion_term(U, V, dx, dy, nu, nx, ny)
+    U_temp, V_temp = compute_temporary_velocities(U, V, A_u, D_u, A_v, D_v, dt, nx, ny, 
+                                                 inlets, outlets, mask_u, mask_v, inlet_temp, inlet_velocity)
+    
+    # Pressure-velocity coupling
+    P = solve_pressure_poisson(P, U_temp, V_temp, dx, dy, dt, density, nx, ny, outlets)
+    update_velocities(U, V, U_temp, V_temp, P, dt, density, dx, dy, nx, ny, 
+                     mask_u, mask_v, inlets, outlets, inlet_temp, inlet_velocity)
+    
+    # Energy equation
+    apply_temperature_bc(T, nx, ny, inlets, inlet_temp)
+    T = advection_diffusion_temperature(T, U, V, dx, dy, dt, nx, ny, mask_p, fluid_props, battery_props)
+    apply_temperature_bc(T, nx, ny, inlets, inlet_temp)
+
+    # Store results at intervals
+    if n % frame_interval == 0:
+        # Calculate velocity magnitude at cell centers
+        U_center = 0.5*(U[1:-1, :-1] + U[1:-1, 1:])
+        V_center = 0.5*(V[:-1, 1:-1] + V[1:, 1:-1])
+        velmag = np.sqrt(U_center**2 + V_center**2)
+        velmag[~mask_p[1:-1, 1:-1]] = np.nan  # Mask obstacles
+        
+        # Store frames
+        frames_T.append(T[1:-1, 1:-1].copy())
+        frames_vel.append(velmag.copy())
+        frames_P.append(P[1:-1, 1:-1].copy())
+        
+        # Print thermal status
+        avg_battery_temp = np.mean(T[~mask_p])
+        print(f"Iter {n}: Avg Battery Temp = {avg_battery_temp:.2f} K")
+
+# ========== VISUALIZATION ========== #
+def create_animation(frames, title, cmap, label):
+    """Helper function to create animations."""
+    fig, ax = plt.subplots()
+    cont = ax.contourf(x_p[1:-1, 1:-1], y_p[1:-1, 1:-1], frames[0], cmap=cmap)
+    plt.colorbar(cont, ax=ax, label=label)
+    
+    # Add obstacle rectangles
+    for obs in obstacles:
+        rect = Rectangle((obs['x_start'], obs['y_start']), 
+                        obs['x_end']-obs['x_start'], 
+                        obs['y_end']-obs['y_start'],
+                        linewidth=1.5, edgecolor='k', facecolor='none')
+        ax.add_patch(rect)
+    
+    ax.set_title(title)
+    ax.set_xlim(0, Lx)
+    ax.set_ylim(0, Ly)
+    
+    def update(frame):
+        ax.collections = []
+        cont = ax.contourf(x_p[1:-1, 1:-1], y_p[1:-1, 1:-1], frames[frame], cmap=cmap)
+        return cont.collections
+    
+    return FuncAnimation(fig, update, frames=len(frames), interval=200)
+
+# Create and save animations
+anim_T = create_animation(frames_T, "Temperature Evolution", "jet", "Temperature (K)")
+anim_vel = create_animation(frames_vel, "Velocity Magnitude", "viridis", "Velocity (m/s)")
+anim_P = create_animation(frames_P, "Pressure Distribution", "coolwarm", "Pressure (Pa)")
+
+anim_T.save('battery_temperature.mp4', writer='ffmpeg', fps=15)
+anim_vel.save('velocity_field.mp4', writer='ffmpeg', fps=15)
+anim_P.save('pressure_field.mp4', writer='ffmpeg', fps=15)
+
+plt.show()
